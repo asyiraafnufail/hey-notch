@@ -216,6 +216,34 @@ final class SystemStats {
         return cachedBattery
     }
 
+    // MARK: - Event-Driven IOKit Power Source Listener (Zero Polling Overhead)
+    private var powerRunLoopSource: CFRunLoopSource?
+    private var powerChangeListener: ((DetailedBatteryInfo) -> Void)?
+
+    func setupPowerSourceListener(onChange: @escaping (DetailedBatteryInfo) -> Void) {
+        self.powerChangeListener = onChange
+
+        if let oldSource = powerRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), oldSource, .defaultMode)
+            powerRunLoopSource = nil
+        }
+
+        let callback: IOPowerSourceCallbackType = { context in
+            guard let context = context else { return }
+            let stats = Unmanaged<SystemStats>.fromOpaque(context).takeUnretainedValue()
+            let info = stats.queryDetailedBatteryInfo(force: true)
+            DispatchQueue.main.async {
+                stats.powerChangeListener?(info)
+            }
+        }
+
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        if let source = IOPSNotificationCreateRunLoopSource(callback, context)?.takeRetainedValue() {
+            self.powerRunLoopSource = source
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+        }
+    }
+
     // MARK: - CoreAudio HAL Detection & Event Listener
     private var currentOutputDeviceID: AudioObjectID = 0
     private var audioChangeListener: ((Bool) -> Void)?

@@ -8,7 +8,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var spacerStatusItem: NSStatusItem?
 
     // Timers
-    private var visibilityTimer: Timer?
     private var statsTimer: Timer?
     private var audioCheckTimer: Timer?
     private var eqAnimationTimer: Timer?
@@ -24,6 +23,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isNotchVisible: Bool = true
     private var isExpanded: Bool = false
     private var isTransitioning: Bool = false
+    private var isSpaceTransitioning: Bool = false
+    private var isMissionControlOpen: Bool = false
+    private var spaceChangeWorkItem: DispatchWorkItem?
+    private var isUserPausing: Bool = false
+    private var pauseCooldownUptime: TimeInterval = 0
     private var outsideClickMonitor: Any?
     private var flagsMonitor: Any?
 
@@ -71,7 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let x = (screenFrame.width - width) / 2
 
         let shownY = screenFrame.height - height
-        let hiddenY = screenFrame.height + 40
+        let hiddenY = screenFrame.height + height // Exactly hidden above top screen bezel
 
         let shownFrame = NSRect(x: x, y: shownY, width: width, height: height)
         let hiddenFrame = NSRect(x: x, y: hiddenY, width: width, height: height)
@@ -117,6 +121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.contentView = notchView
         window.orderFrontRegardless()
+        isNotchVisible = true
     }
 
     private func setupExpandedUI() {
@@ -197,10 +202,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func handleMediaPlayPause() {
         // Proactive instant freeze if currently playing
         if notchView.standbyView.isMediaPlaying {
-            notchView.standbyView.isMediaPlaying = false
+            isUserPausing = true
+            pauseCooldownUptime = ProcessInfo.processInfo.systemUptime + 1.0
+            notchView.standbyView.setMediaPlayingState(false)
             stopEqAnimationTimer()
-            notchView.standbyView.needsDisplay = true
             mediaCard.updateTrack(isPlaying: false, title: mediaCard.trackTitleLabel.stringValue, artist: mediaCard.trackArtistLabel.stringValue)
+        } else {
+            isUserPausing = false
         }
 
         if !NowPlayingManager.shared.togglePlayPause() {
@@ -244,6 +252,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notchView.isExpanded = true
         stopEqAnimationTimer()
 
+        // Disable rasterization during animation for crisp vector rendering
+        notchView.standbyView.layer?.shouldRasterize = false
+
         // Immediate fresh query on expand
         _ = SystemStats.shared.queryRamUsage(force: true)
         _ = SystemStats.shared.queryDetailedBatteryInfo(force: true)
@@ -257,17 +268,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         enableOutsideClickMonitor()
 
-        // 1. Fade out standby indicators smoothly before expand begins (0.10s)
+        // 1. Fast fade-out of standby indicators (0.06s)
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.10
+            context.duration = 0.06
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             notchView.standbyView.animator().alphaValue = 0.0
         }
 
-        // 2. Morph notch shape with Apple fluid spring curve (0.32s)
+        // 2. Fluid morph of notch frame (0.24s, Apple spring curve)
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.32
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.12, 0.95, 0.22, 1.0)
+            context.duration = 0.24
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1.0, 0.3, 1.0)
             window.animator().setFrame(expandedFrame, display: true)
         }, completionHandler: { [weak self] in
             guard let self = self else { return }
@@ -275,11 +286,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.isTransitioning = false
         })
 
-        // 3. Dissolve in expanded container (0.24s)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.24
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            expandedContainer.animator().alphaValue = 1.0
+        // 3. Smooth fade-in of expanded container as frame opens up (0.18s ease-out)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            guard let self = self, self.isExpanded else { return }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.18
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                self.expandedContainer.animator().alphaValue = 1.0
+            }
         }
     }
 
@@ -291,17 +305,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let (shownFrame, _, _) = calculateFrames(for: screen)
 
-        // 1. Fade out expanded content cleanly (0.10s)
+        // 1. Fast fade-out of expanded content (0.06s) to avoid clipping during shrink
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.10
+            context.duration = 0.06
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             expandedContainer.animator().alphaValue = 0.0
         }
 
-        // 2. Shrink notch frame back to standby pill (0.26s)
+        // 2. Snappy shrink of notch frame back to standby pill (0.20s)
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.26
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.25, 0.1, 0.25, 1.0)
+            context.duration = 0.20
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 1.0, 0.3, 1.0)
             window.animator().setFrame(shownFrame, display: true)
         }, completionHandler: { [weak self] in
             guard let self = self else { return }
@@ -309,17 +323,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.notchView.isExpanded = false
             self.expandedContainer.isHidden = true
 
-            // Reset standbyView frame and prepare for smooth fade-in
+            // Restore standbyView frame and fade in cleanly
             self.notchView.standbyView.frame = self.notchView.bounds
             self.notchView.standbyView.isHidden = false
             self.notchView.standbyView.alphaValue = 0.0
 
-            // 3. Smooth fade-in of standby indicators into the collapsed pill (0.20s ease-out)
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.20
+            // 3. Clean fade-in of standby indicators into the resting pill (0.12s ease-out)
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.12
                 context.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 self.notchView.standbyView.animator().alphaValue = 1.0
-            }
+            }, completionHandler: { [weak self] in
+                guard let self = self else { return }
+                if !self.notchView.standbyView.isMediaPlaying {
+                    self.notchView.standbyView.layer?.shouldRasterize = true
+                    self.notchView.standbyView.layer?.rasterizationScale = self.window.backingScaleFactor
+                }
+            })
 
             self.isTransitioning = false
 
@@ -328,6 +348,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.startEqAnimationTimer()
             }
         })
+    }
+
+    private func collapseNotchInstantly() {
+        guard isExpanded else { return }
+        disableOutsideClickMonitor()
+        isExpanded = false
+        isTransitioning = false
+        notchView.isExpanded = false
+
+        expandedContainer.isHidden = true
+        expandedContainer.alphaValue = 0.0
+
+        notchView.standbyView.isHidden = false
+        notchView.standbyView.alphaValue = 1.0
+
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let (shownFrame, _, _) = calculateFrames(for: screen)
+        notchView.frame = NSRect(origin: .zero, size: shownFrame.size)
+        notchView.standbyView.frame = notchView.bounds
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        window.setFrame(shownFrame, display: false)
+        CATransaction.commit()
+
+        if !notchView.standbyView.isMediaPlaying {
+            notchView.standbyView.layer?.shouldRasterize = true
+            notchView.standbyView.layer?.rasterizationScale = window.backingScaleFactor
+        }
     }
 
     private func enableOutsideClickMonitor() {
@@ -352,17 +401,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Observer & Timer Setup (Full Energy Optimization)
     private func setupObservers() {
+        // 1. Workspace Event Listeners (Zero Polling, Event-Driven WindowServer IPC)
         let wsCenter = NSWorkspace.shared.notificationCenter
         wsCenter.addObserver(self, selector: #selector(handleSpaceChange), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         wsCenter.addObserver(self, selector: #selector(triggerCheck), name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        wsCenter.addObserver(self, selector: #selector(triggerCheck), name: NSWorkspace.didDeactivateApplicationNotification, object: nil)
+        wsCenter.addObserver(self, selector: #selector(triggerCheck), name: NSWorkspace.didHideApplicationNotification, object: nil)
+        wsCenter.addObserver(self, selector: #selector(triggerCheck), name: NSWorkspace.didUnhideApplicationNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(triggerCheck), name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
-        // 1. Visibility Fallback Heartbeat (0.5s instead of 0.08s — 84% reduction in WindowServer IPC)
-        visibilityTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.updateVisibility()
-        }
+        // Distributed observers for Mission Control & Desktop gestures (Zero Polling, Event-Driven)
+        let distCenter = DistributedNotificationCenter.default()
+        distCenter.addObserver(self, selector: #selector(handleMissionControlStart), name: NSNotification.Name("com.apple.expose.awake"), object: nil)
+        distCenter.addObserver(self, selector: #selector(handleMissionControlEnd), name: NSNotification.Name("com.apple.expose.destroy"), object: nil)
+        distCenter.addObserver(self, selector: #selector(handleMissionControlStart), name: NSNotification.Name("com.apple.expose.front.awake"), object: nil)
+        distCenter.addObserver(self, selector: #selector(handleMissionControlEnd), name: NSNotification.Name("com.apple.expose.front.destroy"), object: nil)
+        distCenter.addObserver(self, selector: #selector(handleMissionControlStart), name: NSNotification.Name("com.apple.showdesktop.awake"), object: nil)
+        distCenter.addObserver(self, selector: #selector(handleMissionControlEnd), name: NSNotification.Name("com.apple.showdesktop.destroy"), object: nil)
 
-        // 2. Hardware Stats Timer: 2.0s interval for 10s rolling CPU average & 10s cached battery/RAM
+        // 2. Hardware Stats Timer: 2.0s interval for 10s rolling CPU average only
         statsTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refreshStandbyStats()
         }
@@ -377,13 +434,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleAudioStateChanged(isPlaying: isPlaying)
         }
 
-        // 5. Native Caps Lock Event Monitor (0ms latency, zero polling overhead)
+        // 5. Native IOKit Power Source Listener (0ms latency, zero polling overhead)
+        SystemStats.shared.setupPowerSourceListener { [weak self] batInfo in
+            self?.handleBatteryChanged(batInfo: batInfo)
+        }
+
+        // 6. Native Caps Lock Event Monitor (0ms latency, zero polling overhead)
         flagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] _ in
             self?.handleFlagsChanged()
         }
         NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             self?.handleFlagsChanged()
             return event
+        }
+    }
+
+    @objc private func handleMissionControlStart() {
+        isMissionControlOpen = true
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        if isExpanded {
+            collapseNotchInstantly()
+        }
+        hideNotch(screen: screen, animated: true)
+    }
+
+    @objc private func handleMissionControlEnd() {
+        isMissionControlOpen = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
+            guard let self = self, !self.isSpaceTransitioning else { return }
+            self.updateVisibility(animatedHide: false)
         }
     }
 
@@ -399,7 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startEqAnimationTimer() {
         guard eqAnimationTimer == nil else { return }
-        // 25 FPS smooth equalizer animation ONLY while media plays
+        // 25 FPS smooth equalizer animation ONLY while media plays (bypasses CPU draw)
         eqAnimationTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: true) { [weak self] _ in
             guard let self = self, self.isNotchVisible, !self.isExpanded, self.notchView.standbyView.isMediaPlaying else { return }
 
@@ -410,8 +489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             self.notchView.standbyView.eqPhase += 0.28
-            // Partial dirty-rect invalidation: only redraw the 25pt equalizer strip
-            self.notchView.standbyView.invalidateEqualizer()
+            self.notchView.standbyView.updateEqualizerBars()
         }
     }
 
@@ -421,8 +499,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleAudioStateChanged(isPlaying: Bool) {
+        if isPlaying {
+            // Buffer drain debounce: ignore false positive play state right after user clicked pause
+            if isUserPausing {
+                if ProcessInfo.processInfo.systemUptime < pauseCooldownUptime {
+                    return
+                } else {
+                    isUserPausing = false
+                }
+            }
+        } else {
+            isUserPausing = false
+        }
+
         guard notchView.standbyView.isMediaPlaying != isPlaying else { return }
-        notchView.standbyView.isMediaPlaying = isPlaying
+        notchView.standbyView.setMediaPlayingState(isPlaying)
         if isPlaying {
             if !isExpanded {
                 startEqAnimationTimer()
@@ -430,10 +521,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             stopEqAnimationTimer()
         }
-        if !isExpanded {
-            notchView.standbyView.invalidateEqualizer()
-        } else {
+        if isExpanded {
             updateNowPlayingInfo(isPlaying: isPlaying)
+        }
+    }
+
+    private func handleBatteryChanged(batInfo: DetailedBatteryInfo) {
+        var needsRedraw = false
+        if notchView.standbyView.batteryPercent != batInfo.percent || notchView.standbyView.isBatteryCharging != batInfo.isCharging {
+            notchView.standbyView.batteryPercent = batInfo.percent
+            notchView.standbyView.isBatteryCharging = batInfo.isCharging
+            needsRedraw = true
+        }
+
+        if !isExpanded {
+            if needsRedraw {
+                notchView.standbyView.needsDisplay = true
+            }
+        } else {
+            updateExpandedBatteryStats()
         }
     }
 
@@ -444,30 +550,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshStandbyStats() {
         let avgCpu = SystemStats.shared.updateCpuAverage()
-        let batInfo = SystemStats.shared.queryDetailedBatteryInfo()
-
-        var needsRedraw = false
-        if notchView.standbyView.batteryPercent != batInfo.percent || notchView.standbyView.isBatteryCharging != batInfo.isCharging {
-            notchView.standbyView.batteryPercent = batInfo.percent
-            notchView.standbyView.isBatteryCharging = batInfo.isCharging
-            needsRedraw = true
-        }
 
         // Heartbeat filter: only redraw if CPU load tier changes (<40%, 40-75%, >75%)
         let oldTier = notchView.standbyView.cpuTier
         notchView.standbyView.cpuUsage = avgCpu
-        if oldTier != notchView.standbyView.cpuTier {
-            needsRedraw = true
-        }
 
         if !isExpanded {
-            if needsRedraw {
+            if oldTier != notchView.standbyView.cpuTier {
                 notchView.standbyView.needsDisplay = true
             }
         } else {
             updateExpandedHardwareStats()
-            updateExpandedBatteryStats()
         }
+    }
+
+    // MARK: - Cached Static Formatted Text (Zero Heap Churn)
+    private enum FormattedTextCache {
+        static let centerStyle: NSMutableParagraphStyle = {
+            let style = NSMutableParagraphStyle()
+            style.alignment = .center
+            return style
+        }()
+
+        static let fontRegular11 = NSFont.systemFont(ofSize: 11, weight: .medium)
+        static let fontBold11 = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .bold)
+        static let fontRegular10_5 = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        static let fontBold10_5 = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .bold)
+
+        static let dimColor = NSColor.white.withAlphaComponent(0.45)
+        static let greenColor = NSColor(calibratedRed: 0.35, green: 0.85, blue: 0.45, alpha: 1.0)
+
+        static let bulletSeparator: NSAttributedString = {
+            NSAttributedString(string: "  •  ", attributes: [
+                .foregroundColor: dimColor,
+                .font: fontRegular11,
+                .paragraphStyle: centerStyle
+            ])
+        }()
+
+        static let bulletSeparatorSmall: NSAttributedString = {
+            NSAttributedString(string: "  •  ", attributes: [
+                .foregroundColor: dimColor,
+                .font: fontRegular10_5,
+                .paragraphStyle: centerStyle
+            ])
+        }()
+
+        static let avgCpuLabel: NSAttributedString = {
+            NSAttributedString(string: "Avg. CPU ", attributes: [
+                .foregroundColor: dimColor,
+                .font: fontRegular11,
+                .paragraphStyle: centerStyle
+            ])
+        }()
+
+        static let ramLabel: NSAttributedString = {
+            NSAttributedString(string: "RAM ", attributes: [
+                .foregroundColor: dimColor,
+                .font: fontRegular11,
+                .paragraphStyle: centerStyle
+            ])
+        }()
+
+        static let tempLabel: NSAttributedString = {
+            NSAttributedString(string: "Temp ", attributes: [
+                .foregroundColor: dimColor,
+                .font: fontRegular11,
+                .paragraphStyle: centerStyle
+            ])
+        }()
+
+        static let throttleLabel: NSAttributedString = {
+            NSAttributedString(string: "Throttle ", attributes: [
+                .foregroundColor: dimColor,
+                .font: fontRegular11,
+                .paragraphStyle: centerStyle
+            ])
+        }()
     }
 
     private func updateExpandedHardwareStats() {
@@ -478,39 +637,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let temp = SystemStats.shared.queryCpuTemperature(cpu: SystemStats.shared.currentAverageCpu)
         let (throttleText, throttleColor) = SystemStats.shared.throttleStatusShort()
 
-        let centerStyle = NSMutableParagraphStyle()
-        centerStyle.alignment = .center
-
         let text = NSMutableAttributedString()
 
-        func append(_ str: String, color: NSColor = .white, bold: Bool = false) {
-            let font: NSFont = bold ? .monospacedDigitSystemFont(ofSize: 11, weight: .bold) : .systemFont(ofSize: 11, weight: .medium)
+        func append(_ str: String, color: NSColor, bold: Bool = true) {
+            let font = bold ? FormattedTextCache.fontBold11 : FormattedTextCache.fontRegular11
             let attrs: [NSAttributedString.Key: Any] = [
                 .foregroundColor: color,
                 .font: font,
-                .paragraphStyle: centerStyle
+                .paragraphStyle: FormattedTextCache.centerStyle
             ]
             text.append(NSAttributedString(string: str, attributes: attrs))
         }
 
-        let dim = NSColor.white.withAlphaComponent(0.45)
-        append("Avg. CPU ", color: dim)
-        let cpuColor: NSColor = cpuInt > 75 ? .systemRed : (cpuInt > 40 ? .systemOrange : NSColor(calibratedRed: 0.35, green: 0.85, blue: 0.45, alpha: 1.0))
-        append("\(cpuInt)%", color: cpuColor, bold: true)
+        text.append(FormattedTextCache.avgCpuLabel)
+        let cpuColor: NSColor = cpuInt > 75 ? .systemRed : (cpuInt > 40 ? .systemOrange : FormattedTextCache.greenColor)
+        append("\(cpuInt)%", color: cpuColor)
 
-        append("  •  ", color: dim)
-        append("RAM ", color: dim)
-        let ramColor: NSColor = ram.percent > 85 ? .systemRed : (ram.percent > 65 ? .systemOrange : NSColor(calibratedRed: 0.35, green: 0.85, blue: 0.45, alpha: 1.0))
-        append("\(ram.percent)%", color: ramColor, bold: true)
+        text.append(FormattedTextCache.bulletSeparator)
+        text.append(FormattedTextCache.ramLabel)
+        let ramColor: NSColor = ram.percent > 85 ? .systemRed : (ram.percent > 65 ? .systemOrange : FormattedTextCache.greenColor)
+        append("\(ram.percent)%", color: ramColor)
 
-        append("  •  ", color: dim)
-        append("Temp ", color: dim)
-        let tempColor: NSColor = temp > 85 ? .systemRed : (temp > 70 ? .systemOrange : NSColor(calibratedRed: 0.35, green: 0.85, blue: 0.45, alpha: 1.0))
-        append("\(temp)°C", color: tempColor, bold: true)
+        text.append(FormattedTextCache.bulletSeparator)
+        text.append(FormattedTextCache.tempLabel)
+        let tempColor: NSColor = temp > 85 ? .systemRed : (temp > 70 ? .systemOrange : FormattedTextCache.greenColor)
+        append("\(temp)°C", color: tempColor)
 
-        append("  •  ", color: dim)
-        append("Throttle ", color: dim)
-        append(throttleText, color: throttleColor, bold: true)
+        text.append(FormattedTextCache.bulletSeparator)
+        text.append(FormattedTextCache.throttleLabel)
+        append(throttleText, color: throttleColor)
 
         hwSummaryLabel.attributedStringValue = text
         updateNowPlayingInfo(isPlaying: notchView.standbyView.isMediaPlaying)
@@ -520,68 +675,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard isExpanded else { return }
 
         let batInfo = SystemStats.shared.queryDetailedBatteryInfo()
-
-        let centerStyle = NSMutableParagraphStyle()
-        centerStyle.alignment = .center
-
         let text = NSMutableAttributedString()
-        let dim = NSColor.white.withAlphaComponent(0.45)
 
-        func append(_ str: String, color: NSColor = .white, bold: Bool = false) {
-            let font: NSFont = bold ? .monospacedDigitSystemFont(ofSize: 10.5, weight: .bold) : .systemFont(ofSize: 10.5, weight: .medium)
+        func append(_ str: String, color: NSColor, bold: Bool = true) {
+            let font = bold ? FormattedTextCache.fontBold10_5 : FormattedTextCache.fontRegular10_5
             let attrs: [NSAttributedString.Key: Any] = [
                 .foregroundColor: color,
                 .font: font,
-                .paragraphStyle: centerStyle
+                .paragraphStyle: FormattedTextCache.centerStyle
             ]
             text.append(NSAttributedString(string: str, attributes: attrs))
         }
 
-        let green = NSColor(calibratedRed: 0.35, green: 0.85, blue: 0.45, alpha: 1.0)
+        let green = FormattedTextCache.greenColor
+        let dim = FormattedTextCache.dimColor
         let batColor: NSColor = batInfo.percent > 50 ? green : (batInfo.percent > 20 ? .systemYellow : .systemRed)
 
         if batInfo.isAC {
             if batInfo.percent >= 100 {
-                append("⚡ 100% Fully Charged", color: green, bold: true)
+                append("⚡ 100% Fully Charged", color: green)
                 if let w = batInfo.watts {
-                    append("  •  ", color: dim)
-                    append("\(w)W Adapter", color: NSColor.white.withAlphaComponent(0.75))
+                    text.append(FormattedTextCache.bulletSeparatorSmall)
+                    append("\(w)W Adapter", color: NSColor.white.withAlphaComponent(0.75), bold: false)
                 }
             } else if batInfo.isCharging {
-                append("⚡ Charging ", color: green, bold: true)
-                append("\(batInfo.percent)%", color: batColor, bold: true)
+                append("⚡ Charging ", color: green)
+                append("\(batInfo.percent)%", color: batColor)
                 if let w = batInfo.watts {
-                    append(" (\(w)W)", color: NSColor.white.withAlphaComponent(0.85), bold: true)
+                    append(" (\(w)W)", color: NSColor.white.withAlphaComponent(0.85))
                 }
-                append("  •  ", color: dim)
+                text.append(FormattedTextCache.bulletSeparatorSmall)
                 if let ttf = batInfo.timeToFull {
                     let h = ttf / 60
                     let m = ttf % 60
                     let estStr = h > 0 ? "\(h)h \(m)m to full" : "\(m)m to full"
-                    append(estStr, color: NSColor.white.withAlphaComponent(0.85))
+                    append(estStr, color: NSColor.white.withAlphaComponent(0.85), bold: false)
                 } else {
-                    append("Calculating time...", color: dim)
+                    append("Calculating time...", color: dim, bold: false)
                 }
             } else {
-                append("⚡ On AC Power ", color: green, bold: true)
-                append("\(batInfo.percent)%", color: batColor, bold: true)
+                append("⚡ On AC Power ", color: green)
+                append("\(batInfo.percent)%", color: batColor)
                 if let w = batInfo.watts {
-                    append(" (\(w)W)", color: NSColor.white.withAlphaComponent(0.85), bold: true)
+                    append(" (\(w)W)", color: NSColor.white.withAlphaComponent(0.85))
                 }
-                append("  •  ", color: dim)
-                append("Hold (Optimized)", color: NSColor.systemYellow)
+                text.append(FormattedTextCache.bulletSeparatorSmall)
+                append("Hold (Optimized)", color: NSColor.systemYellow, bold: false)
             }
         } else {
-            append("🔋 Battery ", color: dim)
-            append("\(batInfo.percent)%", color: batColor, bold: true)
-            append("  •  ", color: dim)
+            append("🔋 Battery ", color: dim, bold: false)
+            append("\(batInfo.percent)%", color: batColor)
+            text.append(FormattedTextCache.bulletSeparatorSmall)
             if let tte = batInfo.timeToEmpty {
                 let h = tte / 60
                 let m = tte % 60
                 let estStr = h > 0 ? "\(h)h \(m)m remaining" : "\(m)m remaining"
-                append(estStr, color: NSColor.white.withAlphaComponent(0.85))
+                append(estStr, color: NSColor.white.withAlphaComponent(0.85), bold: false)
             } else {
-                append("Calculating time...", color: dim)
+                append("Calculating time...", color: dim, bold: false)
             }
         }
 
@@ -589,28 +740,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateNowPlayingInfo(isPlaying: Bool) {
+        let effectivePlaying = (isUserPausing && ProcessInfo.processInfo.systemUptime < pauseCooldownUptime) ? false : isPlaying
         NowPlayingManager.shared.queryNowPlaying { [weak self] title, artist in
-            self?.mediaCard.updateTrack(isPlaying: isPlaying, title: title, artist: artist)
+            self?.mediaCard.updateTrack(isPlaying: effectivePlaying, title: title, artist: artist)
         }
     }
 
     @objc private func handleSpaceChange() {
-        if isExpanded { collapseNotch() }
-        isNotchVisible = false
-        updateVisibility()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            self?.updateVisibility()
+        if isExpanded {
+            collapseNotchInstantly()
         }
+        isSpaceTransitioning = true
+        spaceChangeWorkItem?.cancel()
+
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+
+        // Immediately hide notch on space change (0ms, vanishes cleanly)
+        hideNotch(screen: screen, animated: false)
+
+        // Settled check (80ms): Fast, crisp, responsive return to desktop
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.isSpaceTransitioning = false
+            guard let scr = NSScreen.main ?? NSScreen.screens.first else { return }
+            if self.isFullScreenActive(for: scr) || self.isMissionControlActive() {
+                self.hideNotch(screen: scr, animated: false)
+            } else {
+                self.showNotch(screen: scr)
+            }
+        }
+        spaceChangeWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: workItem)
     }
 
     @objc private func triggerCheck() {
-        updateVisibility()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            self?.updateVisibility()
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        if isFullScreenActive(for: screen) || isMissionControlActive() {
+            hideNotch(screen: screen, animated: false)
+        } else if !isSpaceTransitioning {
+            updateVisibility(animatedHide: false)
         }
     }
 
     private func isMissionControlActive() -> Bool {
+        if isMissionControlOpen { return true }
         guard let dockApp = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else {
             return false
         }
@@ -645,9 +818,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let boundsDict = info[kCGWindowBounds as String] as? [String: Any],
                   let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else { continue }
 
-            guard bounds.width > 150 else { continue }
+            guard bounds.width >= 200 else { continue }
 
-            if bounds.height >= (screenFrame.height - 4) {
+            // Native macOS fullscreen window starts at top (y <= 1) and spans full screen height
+            if bounds.origin.y <= 1 && bounds.height >= (screenFrame.height - 2) {
                 return true
             }
         }
@@ -665,7 +839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.orderFrontRegardless()
 
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.30
+            context.duration = 0.20
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1.0, 0.3, 1.0)
             window.animator().setFrame(shownFrame, display: true)
             window.animator().alphaValue = 1.0
@@ -673,42 +847,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Resume equalizer animation if audio is playing upon returning to space
         let isAudioPlaying = SystemStats.shared.isSystemAudioPlaying()
-        notchView.standbyView.isMediaPlaying = isAudioPlaying
+        notchView.standbyView.setMediaPlayingState(isAudioPlaying)
         if isAudioPlaying {
             startEqAnimationTimer()
         } else {
             stopEqAnimationTimer()
-            notchView.standbyView.invalidateEqualizer()
         }
     }
 
-    private func hideNotch(screen: NSScreen) {
-        if isExpanded { collapseNotch() }
-        guard isNotchVisible, !isTransitioning else { return }
+    private func hideNotch(screen: NSScreen, animated: Bool = true) {
+        if isExpanded {
+            collapseNotchInstantly()
+        }
+        guard isNotchVisible || window.isVisible else { return }
         isNotchVisible = false
+        isTransitioning = false
         stopEqAnimationTimer()
 
         let (_, hiddenFrame, _) = calculateFrames(for: screen)
 
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.30
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.3, 0.0, 0.84, 0.15)
-            window.animator().setFrame(hiddenFrame, display: true)
-            window.animator().alphaValue = 0.0
-        }, completionHandler: { [weak self] in
-            guard let self = self else { return }
-            if !self.isNotchVisible {
-                self.window.orderOut(nil)
-            }
-        })
+        if animated {
+            isTransitioning = true
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(controlPoints: 0.25, 0.0, 0.7, 0.15)
+                window.animator().setFrame(hiddenFrame, display: true)
+                window.animator().alphaValue = 0.0
+            }, completionHandler: { [weak self] in
+                guard let self = self else { return }
+                self.isTransitioning = false
+                if !self.isNotchVisible {
+                    self.window.orderOut(nil)
+                }
+            })
+        } else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            window.setFrame(hiddenFrame, display: false)
+            window.alphaValue = 0.0
+            CATransaction.commit()
+            window.orderOut(nil)
+        }
     }
 
-    private func updateVisibility() {
+    private func updateVisibility(animatedHide: Bool = true) {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let shouldHide = isMissionControlActive() || isFullScreenActive(for: screen)
 
         if shouldHide {
-            hideNotch(screen: screen)
+            hideNotch(screen: screen, animated: animatedHide)
         } else {
             showNotch(screen: screen)
             if isNotchVisible && !isExpanded && notchView.standbyView.isMediaPlaying && eqAnimationTimer == nil {
@@ -723,7 +910,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSEvent.removeMonitor(monitor)
             flagsMonitor = nil
         }
-        visibilityTimer?.invalidate()
         statsTimer?.invalidate()
         audioCheckTimer?.invalidate()
         stopEqAnimationTimer()

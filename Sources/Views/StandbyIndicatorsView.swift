@@ -1,4 +1,5 @@
 import Cocoa
+import QuartzCore
 
 final class StandbyIndicatorsView: NSView {
     var cpuUsage: Double = 0.0
@@ -7,6 +8,39 @@ final class StandbyIndicatorsView: NSView {
     var isCapsLockOn: Bool = false
     var isMediaPlaying: Bool = false
     var eqPhase: Double = 0.0
+
+    private let eqBarLayers: [CALayer] = (0..<5).map { _ in
+        let layer = CALayer()
+        layer.cornerRadius = 1.25
+        layer.cornerCurve = .continuous
+        layer.backgroundColor = NSColor.systemRed.cgColor
+        return layer
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupLayers()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupLayers()
+    }
+
+    private func setupLayers() {
+        wantsLayer = true
+        guard let layer = self.layer else { return }
+        layer.shouldRasterize = true
+        layer.rasterizationScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        for bar in eqBarLayers {
+            layer.addSublayer(bar)
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        updateEqualizerBars()
+    }
 
     var cpuTier: Int {
         if cpuUsage > 75 { return 2 }
@@ -40,10 +74,55 @@ final class StandbyIndicatorsView: NSView {
         return (gap, hbX, capsX, capsSize.width, batX, totalBatWidth, eqX, totalEqWidth)
     }
 
-    func invalidateEqualizer() {
+    func setMediaPlayingState(_ playing: Bool) {
+        isMediaPlaying = playing
+        if playing {
+            layer?.shouldRasterize = false
+        } else {
+            layer?.shouldRasterize = true
+            layer?.rasterizationScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        }
+        updateEqualizerBars()
+    }
+
+    func updateEqualizerBars() {
+        let h = bounds.height
+        guard h < 32 else { return }
+
         let metrics = layoutMetrics()
-        let rect = NSRect(x: metrics.eqX - 2.0, y: 0, width: metrics.eqW + 4.0, height: bounds.height)
-        setNeedsDisplay(rect)
+        let barWidth: CGFloat = 2.5
+        let spacing: CGFloat = 2.0
+
+        let bars: [CGFloat]
+        let color: CGColor
+        if isMediaPlaying {
+            let t = eqPhase
+            let h1 = 5.0 + 3.5 * CGFloat(sin(t))
+            let h2 = 8.0 + 5.5 * CGFloat(sin(t + 1.25))
+            let h3 = 10.0 + 5.0 * CGFloat(sin(t + 2.5))
+            let h4 = 7.5 + 4.5 * CGFloat(sin(t + 3.75))
+            let h5 = 4.5 + 3.0 * CGFloat(sin(t + 5.0))
+            bars = [max(3.0, h1), max(3.0, h2), max(3.0, h3), max(3.0, h4), max(3.0, h5)]
+            color = NSColor.white.withAlphaComponent(0.95).cgColor
+        } else {
+            bars = [3.5, 3.5, 3.5, 3.5, 3.5]
+            color = NSColor.systemRed.cgColor
+        }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, barLayer) in eqBarLayers.enumerated() {
+            let barH = bars[index]
+            let barX = metrics.eqX + CGFloat(index) * (barWidth + spacing)
+            let barY = (h - barH) / 2
+            barLayer.frame = NSRect(x: barX, y: barY, width: barWidth, height: barH)
+            barLayer.backgroundColor = color
+        }
+        CATransaction.commit()
+    }
+
+    func invalidateEqualizer() {
+        updateEqualizerBars()
     }
 
     func invalidateCapsLock() {
@@ -98,7 +177,6 @@ final class StandbyIndicatorsView: NSView {
         let hbX = gap
         let capsX = hbX + heartbeatWidth + gap
         let batX = capsX + capsSize.width + gap
-        let eqX = batX + totalBatWidth + gap
 
         // 3. CPU Heartbeat ECG Waveform (Static vector path, colored by load tier)
         let cpuColor: NSColor
@@ -148,28 +226,7 @@ final class StandbyIndicatorsView: NSView {
         }
         batText.draw(at: NSPoint(x: batX + boltW + boltSpacing, y: (h - batSize.height) / 2), withAttributes: batAttrs)
 
-        // 6. Equalizer 5 Bar
-        let eqColor: NSColor = isMediaPlaying ? NSColor.white.withAlphaComponent(0.95) : NSColor.systemRed
-        eqColor.setFill()
-
-        let bars: [CGFloat]
-        if isMediaPlaying {
-            let t = eqPhase
-            let h1 = 5.0 + 3.5 * CGFloat(sin(t))
-            let h2 = 8.0 + 5.5 * CGFloat(sin(t + 1.25))
-            let h3 = 10.0 + 5.0 * CGFloat(sin(t + 2.5))
-            let h4 = 7.5 + 4.5 * CGFloat(sin(t + 3.75))
-            let h5 = 4.5 + 3.0 * CGFloat(sin(t + 5.0))
-            bars = [max(3.0, h1), max(3.0, h2), max(3.0, h3), max(3.0, h4), max(3.0, h5)]
-        } else {
-            bars = [3.5, 3.5, 3.5, 3.5, 3.5]
-        }
-
-        for (index, barH) in bars.enumerated() {
-            let barX = eqX + CGFloat(index) * (barWidth + spacing)
-            let barY = (h - barH) / 2
-            let barPath = NSBezierPath(roundedRect: NSRect(x: barX, y: barY, width: barWidth, height: barH), xRadius: 1.25, yRadius: 1.25)
-            barPath.fill()
-        }
+        // 6. Update CALayer Equalizer Bars
+        updateEqualizerBars()
     }
 }

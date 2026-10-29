@@ -2,7 +2,6 @@ import Cocoa
 
 final class MediaControlCard: NSView {
     private let titleLabel = NSTextField(labelWithString: "Now Playing")
-    let statusLabel = NSTextField(labelWithString: "● Idle")
     let trackTitleLabel = NSTextField(labelWithString: "No Media")
     let trackArtistLabel = NSTextField(labelWithString: "Paused")
     let prevBtn = NSButton()
@@ -27,17 +26,11 @@ final class MediaControlCard: NSView {
         layer?.borderWidth = 1
         layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
 
-        // Header: "Now Playing" & Status
-        titleLabel.frame = NSRect(x: 12, y: bounds.height - 22, width: 85, height: 14)
+        // Header: "Now Playing"
+        titleLabel.frame = NSRect(x: 12, y: bounds.height - 22, width: bounds.width - 24, height: 14)
         titleLabel.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
         titleLabel.textColor = NSColor.white.withAlphaComponent(0.5)
         addSubview(titleLabel)
-
-        statusLabel.frame = NSRect(x: bounds.width - 82, y: bounds.height - 22, width: 70, height: 14)
-        statusLabel.alignment = .right
-        statusLabel.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
-        statusLabel.textColor = NSColor.systemRed
-        addSubview(statusLabel)
 
         // Track Title
         trackTitleLabel.frame = NSRect(x: 12, y: bounds.height - 42, width: bounds.width - 24, height: 16)
@@ -87,13 +80,9 @@ final class MediaControlCard: NSView {
 
     func updateTrack(isPlaying: Bool, title: String?, artist: String?) {
         if isPlaying {
-            statusLabel.stringValue = "● Playing"
-            statusLabel.textColor = NSColor(calibratedRed: 0.35, green: 0.85, blue: 0.45, alpha: 1.0)
             trackTitleLabel.stringValue = (title != nil && !title!.isEmpty) ? title! : "Audio Playing"
             trackArtistLabel.stringValue = (artist != nil && !artist!.isEmpty) ? artist! : "System Media"
         } else {
-            statusLabel.stringValue = "● Idle"
-            statusLabel.textColor = NSColor.systemRed
             trackTitleLabel.stringValue = (title != nil && !title!.isEmpty) ? title! : "No Media"
             trackArtistLabel.stringValue = (artist != nil && !artist!.isEmpty) ? artist! : "Paused"
         }
