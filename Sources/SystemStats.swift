@@ -279,37 +279,40 @@ final class SystemStats {
     }
 
     func isSystemAudioPlaying() -> Bool {
-        var defaultOutputDeviceID = AudioObjectID(0)
-        var propertySize = UInt32(MemoryLayout<AudioObjectID>.size)
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-
-        let status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            0,
-            nil,
-            &propertySize,
-            &defaultOutputDeviceID
-        )
-
-        guard status == noErr && defaultOutputDeviceID != kAudioObjectUnknown else {
-            return false
+        let deviceID: AudioObjectID
+        if currentOutputDeviceID != 0 && currentOutputDeviceID != kAudioObjectUnknown {
+            deviceID = currentOutputDeviceID
+        } else {
+            var defaultOutputDeviceID = AudioObjectID(0)
+            var propertySize = UInt32(MemoryLayout<AudioObjectID>.size)
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let status = AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                0,
+                nil,
+                &propertySize,
+                &defaultOutputDeviceID
+            )
+            guard status == noErr && defaultOutputDeviceID != kAudioObjectUnknown else { return false }
+            currentOutputDeviceID = defaultOutputDeviceID
+            deviceID = defaultOutputDeviceID
         }
 
         var isRunning: UInt32 = 0
-        propertySize = UInt32(MemoryLayout<UInt32>.size)
-        address = AudioObjectPropertyAddress(
+        var propertySize = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
 
         let runStatus = AudioObjectGetPropertyData(
-            defaultOutputDeviceID,
+            deviceID,
             &address,
             0,
             nil,

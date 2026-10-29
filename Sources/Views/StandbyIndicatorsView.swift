@@ -8,6 +8,50 @@ final class StandbyIndicatorsView: NSView {
     var isMediaPlaying: Bool = false
     var eqPhase: Double = 0.0
 
+    var cpuTier: Int {
+        if cpuUsage > 75 { return 2 }
+        if cpuUsage > 40 { return 1 }
+        return 0
+    }
+
+    // MARK: - Dirty Rect Calculators for Partial Redraw
+    private func layoutMetrics() -> (gap: CGFloat, hbX: CGFloat, capsX: CGFloat, capsW: CGFloat, batX: CGFloat, batW: CGFloat, eqX: CGFloat, eqW: CGFloat) {
+        let w = bounds.width
+        let heartbeatWidth: CGFloat = 16.0
+        let capsSize = ("⇪" as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .bold)])
+        let boltW: CGFloat = isBatteryCharging ? 6.0 : 0.0
+        let boltSpacing: CGFloat = isBatteryCharging ? 3.0 : 0.0
+        let batText = "\(batteryPercent)%" as NSString
+        let batSize = batText.size(withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)])
+        let totalBatWidth = boltW + boltSpacing + batSize.width
+
+        let barWidth: CGFloat = 2.5
+        let spacing: CGFloat = 2.0
+        let totalEqWidth: CGFloat = (5.0 * barWidth) + (4.0 * spacing) // 20.5 pt
+
+        let totalContentWidth = heartbeatWidth + capsSize.width + totalBatWidth + totalEqWidth
+        let gap = max(6.0, (w - totalContentWidth) / 5.0)
+
+        let hbX = gap
+        let capsX = hbX + heartbeatWidth + gap
+        let batX = capsX + capsSize.width + gap
+        let eqX = batX + totalBatWidth + gap
+
+        return (gap, hbX, capsX, capsSize.width, batX, totalBatWidth, eqX, totalEqWidth)
+    }
+
+    func invalidateEqualizer() {
+        let metrics = layoutMetrics()
+        let rect = NSRect(x: metrics.eqX - 2.0, y: 0, width: metrics.eqW + 4.0, height: bounds.height)
+        setNeedsDisplay(rect)
+    }
+
+    func invalidateCapsLock() {
+        let metrics = layoutMetrics()
+        let rect = NSRect(x: metrics.capsX - 3.0, y: 0, width: metrics.capsW + 6.0, height: bounds.height)
+        setNeedsDisplay(rect)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         let w = bounds.width
         let h = bounds.height
@@ -56,7 +100,7 @@ final class StandbyIndicatorsView: NSView {
         let batX = capsX + capsSize.width + gap
         let eqX = batX + totalBatWidth + gap
 
-        // 3. CPU Heartbeat ECG Waveform (Static vector path, colored by load)
+        // 3. CPU Heartbeat ECG Waveform (Static vector path, colored by load tier)
         let cpuColor: NSColor
         if cpuUsage > 75 {
             cpuColor = .systemRed

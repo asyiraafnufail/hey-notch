@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isExpanded: Bool = false
     private var isTransitioning: Bool = false
     private var outsideClickMonitor: Any?
+    private var flagsMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -188,15 +189,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func handleMediaPrev() {
-        sendSystemMediaKey(20)
+        if !NowPlayingManager.shared.previousTrack() {
+            sendSystemMediaKey(20)
+        }
     }
 
     @objc private func handleMediaPlayPause() {
-        sendSystemMediaKey(16)
+        // Proactive instant freeze if currently playing
+        if notchView.standbyView.isMediaPlaying {
+            notchView.standbyView.isMediaPlaying = false
+            stopEqAnimationTimer()
+            notchView.standbyView.needsDisplay = true
+            mediaCard.updateTrack(isPlaying: false, title: mediaCard.trackTitleLabel.stringValue, artist: mediaCard.trackArtistLabel.stringValue)
+        }
+
+        if !NowPlayingManager.shared.togglePlayPause() {
+            sendSystemMediaKey(16)
+        }
     }
 
     @objc private func handleMediaNext() {
-        sendSystemMediaKey(19)
+        if !NowPlayingManager.shared.nextTrack() {
+            sendSystemMediaKey(19)
+        }
     }
 
     private func sendSystemMediaKey(_ key: Int32) {
@@ -361,35 +376,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         SystemStats.shared.setupAudioChangeListener { [weak self] isPlaying in
             self?.handleAudioStateChanged(isPlaying: isPlaying)
         }
+
+        // 5. Native Caps Lock Event Monitor (0ms latency, zero polling overhead)
+        flagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] _ in
+            self?.handleFlagsChanged()
+        }
+        NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            self?.handleFlagsChanged()
+            return event
+        }
     }
 
-    private var eqFrameCount: Int = 0
+    private func handleFlagsChanged() {
+        let caps = NSEvent.modifierFlags.contains(.capsLock)
+        if notchView.standbyView.isCapsLockOn != caps {
+            notchView.standbyView.isCapsLockOn = caps
+            if !isExpanded {
+                notchView.standbyView.invalidateCapsLock()
+            }
+        }
+    }
 
     private func startEqAnimationTimer() {
         guard eqAnimationTimer == nil else { return }
-        eqFrameCount = 0
         // 25 FPS smooth equalizer animation ONLY while media plays
         eqAnimationTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: true) { [weak self] _ in
             guard let self = self, self.isNotchVisible, !self.isExpanded, self.notchView.standbyView.isMediaPlaying else { return }
 
-            // Sub-200ms active poll to stop animation immediately when audio pauses
-            self.eqFrameCount += 1
-            if self.eqFrameCount % 4 == 0 {
-                if !SystemStats.shared.isSystemAudioPlaying() {
-                    self.handleAudioStateChanged(isPlaying: false)
-                    return
-                }
+            // Sub-40ms instant freeze: check audio active state every frame directly via cached device ID
+            if !SystemStats.shared.isSystemAudioPlaying() {
+                self.handleAudioStateChanged(isPlaying: false)
+                return
             }
 
             self.notchView.standbyView.eqPhase += 0.28
-            self.notchView.standbyView.needsDisplay = true
+            // Partial dirty-rect invalidation: only redraw the 25pt equalizer strip
+            self.notchView.standbyView.invalidateEqualizer()
         }
     }
 
     private func stopEqAnimationTimer() {
         eqAnimationTimer?.invalidate()
         eqAnimationTimer = nil
-        eqFrameCount = 0
     }
 
     private func handleAudioStateChanged(isPlaying: Bool) {
@@ -403,7 +431,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stopEqAnimationTimer()
         }
         if !isExpanded {
-            notchView.standbyView.needsDisplay = true
+            notchView.standbyView.invalidateEqualizer()
         } else {
             updateNowPlayingInfo(isPlaying: isPlaying)
         }
@@ -417,20 +445,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshStandbyStats() {
         let avgCpu = SystemStats.shared.updateCpuAverage()
         let batInfo = SystemStats.shared.queryDetailedBatteryInfo()
-        let capsOn = NSEvent.modifierFlags.contains(.capsLock)
 
         var needsRedraw = false
-        if notchView.standbyView.isCapsLockOn != capsOn {
-            notchView.standbyView.isCapsLockOn = capsOn
-            needsRedraw = true
-        }
         if notchView.standbyView.batteryPercent != batInfo.percent || notchView.standbyView.isBatteryCharging != batInfo.isCharging {
             notchView.standbyView.batteryPercent = batInfo.percent
             notchView.standbyView.isBatteryCharging = batInfo.isCharging
             needsRedraw = true
         }
-        if Int(notchView.standbyView.cpuUsage) != Int(avgCpu) {
-            notchView.standbyView.cpuUsage = avgCpu
+
+        // Heartbeat filter: only redraw if CPU load tier changes (<40%, 40-75%, >75%)
+        let oldTier = notchView.standbyView.cpuTier
+        notchView.standbyView.cpuUsage = avgCpu
+        if oldTier != notchView.standbyView.cpuTier {
             needsRedraw = true
         }
 
@@ -644,6 +670,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.animator().setFrame(shownFrame, display: true)
             window.animator().alphaValue = 1.0
         }
+
+        // Resume equalizer animation if audio is playing upon returning to space
+        let isAudioPlaying = SystemStats.shared.isSystemAudioPlaying()
+        notchView.standbyView.isMediaPlaying = isAudioPlaying
+        if isAudioPlaying {
+            startEqAnimationTimer()
+        } else {
+            stopEqAnimationTimer()
+            notchView.standbyView.invalidateEqualizer()
+        }
     }
 
     private func hideNotch(screen: NSScreen) {
@@ -668,14 +704,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateVisibility() {
-        let caps = NSEvent.modifierFlags.contains(.capsLock)
-        if notchView.isCapsLockOn != caps {
-            notchView.isCapsLockOn = caps
-            if !isExpanded {
-                notchView.standbyView.needsDisplay = true
-            }
-        }
-
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let shouldHide = isMissionControlActive() || isFullScreenActive(for: screen)
 
@@ -683,11 +711,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hideNotch(screen: screen)
         } else {
             showNotch(screen: screen)
+            if isNotchVisible && !isExpanded && notchView.standbyView.isMediaPlaying && eqAnimationTimer == nil {
+                startEqAnimationTimer()
+            }
         }
     }
 
     @objc private func quitApp() {
         disableOutsideClickMonitor()
+        if let monitor = flagsMonitor {
+            NSEvent.removeMonitor(monitor)
+            flagsMonitor = nil
+        }
         visibilityTimer?.invalidate()
         statsTimer?.invalidate()
         audioCheckTimer?.invalidate()
