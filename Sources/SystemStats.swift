@@ -9,9 +9,37 @@ final class SystemStats {
     private var previousCpuInfo = host_cpu_load_info()
     private var hasPreviousCpu = false
 
-    private init() {}
+    // 10-second rolling CPU window (5 samples x 2.0s interval)
+    private var cpuLoadHistory: [Double] = []
+    private let maxHistorySamples = 5
+    private(set) var currentAverageCpu: Double = 0.0
 
-    func queryCpuUsage() -> Double {
+    // Caches to avoid redundant polling
+    private var cachedRam = RamInfo(usedGB: 0.0, totalGB: 0.0, percent: 0)
+    private var lastRamCheck: TimeInterval = 0
+
+    private var cachedBattery = DetailedBatteryInfo(percent: 100, isCharging: false, isAC: false, watts: nil, timeToFull: nil, timeToEmpty: nil)
+    private var lastBatteryCheck: TimeInterval = 0
+
+    private init() {
+        // Initial sample
+        _ = sampleInstantCpu()
+    }
+
+    // MARK: - CPU 10-Second Rolling Average
+    @discardableResult
+    func updateCpuAverage() -> Double {
+        let instant = sampleInstantCpu()
+        cpuLoadHistory.append(instant)
+        if cpuLoadHistory.count > maxHistorySamples {
+            cpuLoadHistory.removeFirst()
+        }
+        let avg = cpuLoadHistory.reduce(0.0, +) / Double(cpuLoadHistory.count)
+        currentAverageCpu = avg
+        return avg
+    }
+
+    private func sampleInstantCpu() -> Double {
         var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
         var cpuInfo = host_cpu_load_info()
         let result = withUnsafeMutablePointer(to: &cpuInfo) {
@@ -35,7 +63,14 @@ final class SystemStats {
         return (Double(userDiff + systemDiff + niceDiff) / Double(total)) * 100.0
     }
 
-    func queryRamUsage() -> RamInfo {
+    // MARK: - RAM Usage (10s cached interval)
+    func queryRamUsage(force: Bool = false) -> RamInfo {
+        let now = ProcessInfo.processInfo.systemUptime
+        if !force && (now - lastRamCheck < 10.0) && cachedRam.totalGB > 0 {
+            return cachedRam
+        }
+        lastRamCheck = now
+
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
         var vmStats = vm_statistics64()
         let result = withUnsafeMutablePointer(to: &vmStats) {
@@ -47,7 +82,8 @@ final class SystemStats {
         let totalGB = Double(totalBytes) / 1_073_741_824.0
 
         guard result == KERN_SUCCESS else {
-            return RamInfo(usedGB: 0.0, totalGB: totalGB, percent: 0)
+            cachedRam = RamInfo(usedGB: 0.0, totalGB: totalGB, percent: 0)
+            return cachedRam
         }
 
         let pageSize = UInt64(getpagesize())
@@ -58,11 +94,13 @@ final class SystemStats {
         let usedGB = Double(usedBytes) / 1_073_741_824.0
         let percent = min(100, max(0, Int((Double(usedBytes) / Double(totalBytes)) * 100.0)))
 
-        return RamInfo(usedGB: usedGB, totalGB: totalGB, percent: percent)
+        cachedRam = RamInfo(usedGB: usedGB, totalGB: totalGB, percent: percent)
+        return cachedRam
     }
 
+    // MARK: - Temperature & Thermal Throttle
     func queryCpuTemperature(cpu: Double) -> Int {
-        // ponytail: Direct SMC read requires root/kext on macOS Ventura; computed from Mach CPU load & thermalState
+        // ponytail: Direct SMC read requires root/kext on macOS Ventura; computed from 10s avg Mach CPU load & thermalState
         var temp = 46.0 + (cpu * 0.42)
         switch ProcessInfo.processInfo.thermalState {
         case .fair:
@@ -92,7 +130,14 @@ final class SystemStats {
         }
     }
 
-    func queryDetailedBatteryInfo() -> DetailedBatteryInfo {
+    // MARK: - Battery & Charging Power (10s cached interval)
+    func queryDetailedBatteryInfo(force: Bool = false) -> DetailedBatteryInfo {
+        let now = ProcessInfo.processInfo.systemUptime
+        if !force && (now - lastBatteryCheck < 10.0) {
+            return cachedBattery
+        }
+        lastBatteryCheck = now
+
         var percent = 100
         var isCharging = false
         var isAC = false
@@ -160,7 +205,7 @@ final class SystemStats {
             }
         }
 
-        return DetailedBatteryInfo(
+        cachedBattery = DetailedBatteryInfo(
             percent: percent,
             isCharging: isCharging || isAC,
             isAC: isAC,
@@ -168,6 +213,69 @@ final class SystemStats {
             timeToFull: timeToFull,
             timeToEmpty: timeToEmpty
         )
+        return cachedBattery
+    }
+
+    // MARK: - CoreAudio HAL Detection & Event Listener
+    private var currentOutputDeviceID: AudioObjectID = 0
+    private var audioChangeListener: ((Bool) -> Void)?
+
+    func setupAudioChangeListener(onChange: @escaping (Bool) -> Void) {
+        self.audioChangeListener = onChange
+        bindToDefaultOutputDevice()
+
+        // Listen for system default audio output changes (e.g. AirPods connected/disconnected)
+        var defDeviceAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defDeviceAddr,
+            DispatchQueue.main
+        ) { [weak self] _, _ in
+            self?.bindToDefaultOutputDevice()
+            let playing = self?.isSystemAudioPlaying() ?? false
+            self?.audioChangeListener?(playing)
+        }
+    }
+
+    private func bindToDefaultOutputDevice() {
+        var defaultOutputDeviceID = AudioObjectID(0)
+        var propertySize = UInt32(MemoryLayout<AudioObjectID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &propertySize,
+            &defaultOutputDeviceID
+        )
+
+        guard status == noErr && defaultOutputDeviceID != kAudioObjectUnknown else { return }
+        currentOutputDeviceID = defaultOutputDeviceID
+
+        var runningAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        AudioObjectAddPropertyListenerBlock(
+            defaultOutputDeviceID,
+            &runningAddr,
+            DispatchQueue.main
+        ) { [weak self] _, _ in
+            let playing = self?.isSystemAudioPlaying() ?? false
+            self?.audioChangeListener?(playing)
+        }
     }
 
     func isSystemAudioPlaying() -> Bool {

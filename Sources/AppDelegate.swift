@@ -6,8 +6,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var notchView: NotchView!
     var statusItem: NSStatusItem!
     var spacerStatusItem: NSStatusItem?
-    var timer: Timer?
-    var statsTimer: Timer?
+
+    // Timers
+    private var visibilityTimer: Timer?
+    private var statsTimer: Timer?
+    private var audioCheckTimer: Timer?
+    private var eqAnimationTimer: Timer?
 
     // UI Container Expanded (Hardware, Battery Power, Media & Drop Shelf)
     var expandedContainer: NSView!
@@ -21,7 +25,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isExpanded: Bool = false
     private var isTransitioning: Bool = false
     private var outsideClickMonitor: Any?
-    private var statsTick: Int = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -29,6 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupNotchWindow()
         setupExpandedUI()
         setupObservers()
+
+        // Initial fetch
+        SystemStats.shared.updateCpuAverage()
+        _ = SystemStats.shared.queryRamUsage(force: true)
+        _ = SystemStats.shared.queryDetailedBatteryInfo(force: true)
         refreshStandbyStats()
         updateVisibility()
     }
@@ -120,26 +128,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let closeSize: CGFloat = 24
 
-        // 1. Hardware Summary Strip (CPU %, RAM %, Core Temp, Throttle)
-        hwSummaryLabel = NSTextField(labelWithString: "CPU --%  •  RAM --%  •  --°C  •  Normal")
-        hwSummaryLabel.frame = NSRect(x: 18, y: 144, width: 375, height: 18)
+        // 1. Hardware Summary Strip (Centered & Symmetrical)
+        hwSummaryLabel = NSTextField(labelWithString: "")
+        hwSummaryLabel.alignment = .center
+        hwSummaryLabel.frame = NSRect(x: 14, y: 144, width: expWidth - 28, height: 18)
         hwSummaryLabel.isBezeled = false
         hwSummaryLabel.drawsBackground = false
         hwSummaryLabel.isEditable = false
         hwSummaryLabel.isSelectable = false
         expandedContainer.addSubview(hwSummaryLabel)
 
-        // 2. Battery & Charging Power Summary Strip
-        batterySummaryLabel = NSTextField(labelWithString: "⚡ Battery --%")
-        batterySummaryLabel.frame = NSRect(x: 18, y: 122, width: 375, height: 18)
+        // 2. Battery & Charging Power Summary Strip (Centered & Symmetrical)
+        batterySummaryLabel = NSTextField(labelWithString: "")
+        batterySummaryLabel.alignment = .center
+        batterySummaryLabel.frame = NSRect(x: 14, y: 122, width: expWidth - 28, height: 18)
         batterySummaryLabel.isBezeled = false
         batterySummaryLabel.drawsBackground = false
         batterySummaryLabel.isEditable = false
         batterySummaryLabel.isSelectable = false
         expandedContainer.addSubview(batterySummaryLabel)
 
-        // Close Button (Vertically centered against summary rows)
-        closeButton = NSButton(frame: NSRect(x: expWidth - closeSize - 16, y: 129, width: closeSize, height: closeSize))
+        // Close Button (Right edge, vertically centered between 2 header rows)
+        closeButton = NSButton(frame: NSRect(x: expWidth - closeSize - 14, y: 129, width: closeSize, height: closeSize))
         closeButton.title = "✕"
         closeButton.isBordered = false
         closeButton.wantsLayer = true
@@ -217,7 +227,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isTransitioning = true
         isExpanded = true
         notchView.isExpanded = true
+        stopEqAnimationTimer()
 
+        // Immediate fresh query on expand
+        _ = SystemStats.shared.queryRamUsage(force: true)
+        _ = SystemStats.shared.queryDetailedBatteryInfo(force: true)
         updateExpandedHardwareStats()
         updateExpandedBatteryStats()
 
@@ -293,6 +307,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             self.isTransitioning = false
+
+            // Resume equalizer animation if audio is currently playing
+            if self.notchView.standbyView.isMediaPlaying {
+                self.startEqAnimationTimer()
+            }
         })
     }
 
@@ -316,83 +335,140 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Observer & Timer Setup (Full Energy Optimization)
     private func setupObservers() {
         let wsCenter = NSWorkspace.shared.notificationCenter
         wsCenter.addObserver(self, selector: #selector(handleSpaceChange), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         wsCenter.addObserver(self, selector: #selector(triggerCheck), name: NSWorkspace.didActivateApplicationNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(triggerCheck), name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
-        timer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+        // 1. Visibility Fallback Heartbeat (0.5s instead of 0.08s — 84% reduction in WindowServer IPC)
+        visibilityTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.updateVisibility()
         }
 
-        statsTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+        // 2. Hardware Stats Timer: 2.0s interval for 10s rolling CPU average & 10s cached battery/RAM
+        statsTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refreshStandbyStats()
+        }
+
+        // 3. Audio status check: 1.5s interval fallback
+        audioCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.checkCurrentMediaPlaying()
+        }
+
+        // 4. Native CoreAudio HAL Event Listener (instant 0ms trigger on play/pause)
+        SystemStats.shared.setupAudioChangeListener { [weak self] isPlaying in
+            self?.handleAudioStateChanged(isPlaying: isPlaying)
+        }
+    }
+
+    private var eqFrameCount: Int = 0
+
+    private func startEqAnimationTimer() {
+        guard eqAnimationTimer == nil else { return }
+        eqFrameCount = 0
+        // 25 FPS smooth equalizer animation ONLY while media plays
+        eqAnimationTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: true) { [weak self] _ in
+            guard let self = self, self.isNotchVisible, !self.isExpanded, self.notchView.standbyView.isMediaPlaying else { return }
+
+            // Sub-200ms active poll to stop animation immediately when audio pauses
+            self.eqFrameCount += 1
+            if self.eqFrameCount % 4 == 0 {
+                if !SystemStats.shared.isSystemAudioPlaying() {
+                    self.handleAudioStateChanged(isPlaying: false)
+                    return
+                }
+            }
+
+            self.notchView.standbyView.eqPhase += 0.28
+            self.notchView.standbyView.needsDisplay = true
+        }
+    }
+
+    private func stopEqAnimationTimer() {
+        eqAnimationTimer?.invalidate()
+        eqAnimationTimer = nil
+        eqFrameCount = 0
+    }
+
+    private func handleAudioStateChanged(isPlaying: Bool) {
+        guard notchView.standbyView.isMediaPlaying != isPlaying else { return }
+        notchView.standbyView.isMediaPlaying = isPlaying
+        if isPlaying {
+            if !isExpanded {
+                startEqAnimationTimer()
+            }
+        } else {
+            stopEqAnimationTimer()
+        }
+        if !isExpanded {
+            notchView.standbyView.needsDisplay = true
+        } else {
+            updateNowPlayingInfo(isPlaying: isPlaying)
         }
     }
 
     private func checkCurrentMediaPlaying() {
         let playing = SystemStats.shared.isSystemAudioPlaying()
-        if notchView.standbyView.isMediaPlaying != playing {
-            notchView.standbyView.isMediaPlaying = playing
-            if !isExpanded {
-                notchView.standbyView.needsDisplay = true
-            } else {
-                updateNowPlayingInfo(isPlaying: playing)
-            }
-        }
+        handleAudioStateChanged(isPlaying: playing)
     }
 
     private func refreshStandbyStats() {
-        checkCurrentMediaPlaying()
-
+        let avgCpu = SystemStats.shared.updateCpuAverage()
+        let batInfo = SystemStats.shared.queryDetailedBatteryInfo()
         let capsOn = NSEvent.modifierFlags.contains(.capsLock)
+
+        var needsRedraw = false
         if notchView.standbyView.isCapsLockOn != capsOn {
             notchView.standbyView.isCapsLockOn = capsOn
-            if !isExpanded {
-                notchView.standbyView.needsDisplay = true
-            }
+            needsRedraw = true
         }
-
-        if notchView.standbyView.isMediaPlaying && !isExpanded {
-            notchView.standbyView.eqPhase += 0.35
-            notchView.standbyView.needsDisplay = true
-        }
-
-        statsTick += 1
-        if statsTick % 4 == 0 {
-            let cpu = SystemStats.shared.queryCpuUsage()
-            let batInfo = SystemStats.shared.queryDetailedBatteryInfo()
-            notchView.standbyView.cpuUsage = cpu
+        if notchView.standbyView.batteryPercent != batInfo.percent || notchView.standbyView.isBatteryCharging != batInfo.isCharging {
             notchView.standbyView.batteryPercent = batInfo.percent
             notchView.standbyView.isBatteryCharging = batInfo.isCharging
-            if !isExpanded {
+            needsRedraw = true
+        }
+        if Int(notchView.standbyView.cpuUsage) != Int(avgCpu) {
+            notchView.standbyView.cpuUsage = avgCpu
+            needsRedraw = true
+        }
+
+        if !isExpanded {
+            if needsRedraw {
                 notchView.standbyView.needsDisplay = true
-            } else {
-                updateExpandedHardwareStats()
-                updateExpandedBatteryStats()
             }
+        } else {
+            updateExpandedHardwareStats()
+            updateExpandedBatteryStats()
         }
     }
 
     private func updateExpandedHardwareStats() {
         guard isExpanded else { return }
 
-        let cpuInt = Int(notchView.standbyView.cpuUsage)
+        let cpuInt = Int(SystemStats.shared.currentAverageCpu)
         let ram = SystemStats.shared.queryRamUsage()
-        let temp = SystemStats.shared.queryCpuTemperature(cpu: notchView.standbyView.cpuUsage)
+        let temp = SystemStats.shared.queryCpuTemperature(cpu: SystemStats.shared.currentAverageCpu)
         let (throttleText, throttleColor) = SystemStats.shared.throttleStatusShort()
+
+        let centerStyle = NSMutableParagraphStyle()
+        centerStyle.alignment = .center
 
         let text = NSMutableAttributedString()
 
         func append(_ str: String, color: NSColor = .white, bold: Bool = false) {
             let font: NSFont = bold ? .monospacedDigitSystemFont(ofSize: 11, weight: .bold) : .systemFont(ofSize: 11, weight: .medium)
-            let attrs: [NSAttributedString.Key: Any] = [.foregroundColor: color, .font: font]
+            let attrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: color,
+                .font: font,
+                .paragraphStyle: centerStyle
+            ]
             text.append(NSAttributedString(string: str, attributes: attrs))
         }
 
         let dim = NSColor.white.withAlphaComponent(0.45)
-        append("CPU ", color: dim)
+        append("Avg. CPU ", color: dim)
         let cpuColor: NSColor = cpuInt > 75 ? .systemRed : (cpuInt > 40 ? .systemOrange : NSColor(calibratedRed: 0.35, green: 0.85, blue: 0.45, alpha: 1.0))
         append("\(cpuInt)%", color: cpuColor, bold: true)
 
@@ -419,12 +495,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let batInfo = SystemStats.shared.queryDetailedBatteryInfo()
 
+        let centerStyle = NSMutableParagraphStyle()
+        centerStyle.alignment = .center
+
         let text = NSMutableAttributedString()
         let dim = NSColor.white.withAlphaComponent(0.45)
 
         func append(_ str: String, color: NSColor = .white, bold: Bool = false) {
             let font: NSFont = bold ? .monospacedDigitSystemFont(ofSize: 10.5, weight: .bold) : .systemFont(ofSize: 10.5, weight: .medium)
-            let attrs: [NSAttributedString.Key: Any] = [.foregroundColor: color, .font: font]
+            let attrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: color,
+                .font: font,
+                .paragraphStyle: centerStyle
+            ]
             text.append(NSAttributedString(string: str, attributes: attrs))
         }
 
@@ -567,6 +650,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isExpanded { collapseNotch() }
         guard isNotchVisible, !isTransitioning else { return }
         isNotchVisible = false
+        stopEqAnimationTimer()
 
         let (_, hiddenFrame, _) = calculateFrames(for: screen)
 
@@ -592,12 +676,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Animasi equalizer hanya berjalan saat audio aktif (0% GPU idle)
-        if isNotchVisible && !isExpanded && notchView.isMediaPlaying {
-            notchView.eqPhase += 0.28
-            notchView.standbyView.needsDisplay = true
-        }
-
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let shouldHide = isMissionControlActive() || isFullScreenActive(for: screen)
 
@@ -610,8 +688,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() {
         disableOutsideClickMonitor()
-        timer?.invalidate()
+        visibilityTimer?.invalidate()
         statsTimer?.invalidate()
+        audioCheckTimer?.invalidate()
+        stopEqAnimationTimer()
         NSApplication.shared.terminate(nil)
     }
 }
