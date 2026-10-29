@@ -13,6 +13,6 @@
     <key>CFBundleVersion</key>
     <string>1.0</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Hey Notch memerlukan izin untuk mendeteksi pemutaran lagu Spotify &amp; Apple Music.</string>
+    <string>Hey Notch requires permission to detect Spotify &amp; Apple Music playback.</string>
 </dict>
 </plist>

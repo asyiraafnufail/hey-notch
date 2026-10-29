@@ -1,5 +1,5 @@
 TARGET = hey-notch
-SRC = Sources/main.swift
+SRC = Sources/*.swift Sources/Views/*.swift
 SWIFTC_FLAGS = -O -target x86_64-apple-macos13.0 -framework Cocoa -framework IOKit -framework CoreAudio -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
 
 all: build
