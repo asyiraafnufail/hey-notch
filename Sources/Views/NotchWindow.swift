@@ -151,8 +151,6 @@ final class NotchView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        if !isExpanded {
-            onNotchClick?()
-        }
+        onNotchClick?()
     }
 }

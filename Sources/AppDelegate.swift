@@ -14,7 +14,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // UI Container Expanded (Hardware, Battery Power, Media & Drop Shelf)
     var expandedContainer: NSView!
-    var closeButton: NSButton!
     var hwSummaryLabel: NSTextField!
     var batterySummaryLabel: NSTextField!
     var mediaCard: MediaControlCard!
@@ -25,7 +24,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isTransitioning: Bool = false
     private var isSpaceTransitioning: Bool = false
     private var isMissionControlOpen: Bool = false
-    private var spaceChangeWorkItem: DispatchWorkItem?
+    private var spaceTransitionWorkItems: [DispatchWorkItem] = []
+
+    private func cancelSpaceTransitionWorkItems() {
+        spaceTransitionWorkItems.forEach { $0.cancel() }
+        spaceTransitionWorkItems.removeAll()
+    }
     private var isUserPausing: Bool = false
     private var pauseCooldownUptime: TimeInterval = 0
     private var outsideClickMonitor: Any?
@@ -111,7 +115,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notchView = NotchView(frame: NSRect(origin: .zero, size: shownFrame.size))
         notchView.wantsLayer = true
         notchView.onNotchClick = { [weak self] in
-            self?.expandNotch()
+            guard let self = self else { return }
+            if self.isExpanded {
+                self.collapseNotch()
+            } else {
+                self.expandNotch()
+            }
         }
         notchView.onDragOver = { [weak self] in
             self?.expandNotch()
@@ -132,8 +141,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         expandedContainer.alphaValue = 0.0
         expandedContainer.isHidden = true
 
-        let closeSize: CGFloat = 24
-
         // 1. Hardware Summary Strip (Centered & Symmetrical)
         hwSummaryLabel = NSTextField(labelWithString: "")
         hwSummaryLabel.alignment = .center
@@ -153,20 +160,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         batterySummaryLabel.isEditable = false
         batterySummaryLabel.isSelectable = false
         expandedContainer.addSubview(batterySummaryLabel)
-
-        // Close Button (Right edge, vertically centered between 2 header rows)
-        closeButton = NSButton(frame: NSRect(x: expWidth - closeSize - 14, y: 129, width: closeSize, height: closeSize))
-        closeButton.title = "✕"
-        closeButton.isBordered = false
-        closeButton.wantsLayer = true
-        closeButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        closeButton.layer?.cornerRadius = closeSize / 2
-        closeButton.layer?.cornerCurve = .continuous
-        closeButton.target = self
-        closeButton.action = #selector(collapseNotch)
-        closeButton.font = NSFont.systemFont(ofSize: 11, weight: .bold)
-        closeButton.contentTintColor = .white
-        expandedContainer.addSubview(closeButton)
 
         // Concentric Card Alignment (14pt uniform margin & 10pt continuous squircle radius):
         // Outer notch arc center: (33, 24) and (407, 24), radius 24pt
@@ -460,9 +453,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleMissionControlEnd() {
         isMissionControlOpen = false
+        cancelSpaceTransitionWorkItems()
+        isSpaceTransitioning = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
-            guard let self = self, !self.isSpaceTransitioning else { return }
-            self.updateVisibility(animatedHide: false)
+            self?.updateVisibility(animatedHide: false)
         }
     }
 
@@ -558,6 +552,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !isExpanded {
             if oldTier != notchView.standbyView.cpuTier {
                 notchView.standbyView.needsDisplay = true
+            }
+
+            // Self-healing check: guarantee notch reappears on desktop if a transition was interrupted
+            if !isSpaceTransitioning && !isMissionControlActive() {
+                if let scr = NSScreen.main ?? NSScreen.screens.first {
+                    let isFS = isFullScreenActive(for: scr)
+                    if !isFS && !isNotchVisible && !isTransitioning {
+                        showNotch(screen: scr)
+                    } else if isFS && isNotchVisible {
+                        hideNotch(screen: scr, animated: false)
+                    }
+                }
             }
         } else {
             updateExpandedHardwareStats()
@@ -751,26 +757,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             collapseNotchInstantly()
         }
         isSpaceTransitioning = true
-        spaceChangeWorkItem?.cancel()
+        cancelSpaceTransitionWorkItems()
 
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
 
         // Immediately hide notch on space change (0ms, vanishes cleanly)
         hideNotch(screen: screen, animated: false)
 
-        // Settled check (80ms): Fast, crisp, responsive return to desktop
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            self.isSpaceTransitioning = false
-            guard let scr = NSScreen.main ?? NSScreen.screens.first else { return }
-            if self.isFullScreenActive(for: scr) || self.isMissionControlActive() {
-                self.hideNotch(screen: scr, animated: false)
-            } else {
-                self.showNotch(screen: scr)
+        // Multi-stage verification checks:
+        // Covers 3-finger swipe (0.18s) and full macOS zoom exit animations (0.32s - 0.68s)
+        let delays: [TimeInterval] = [0.18, 0.32, 0.48, 0.68]
+        for (index, delay) in delays.enumerated() {
+            let isLast = (index == delays.count - 1)
+            let item = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                guard let scr = NSScreen.main ?? NSScreen.screens.first else { return }
+
+                let isMC = self.isMissionControlActive()
+                let isFS = self.isFullScreenActive(for: scr)
+
+                if isMC || isFS {
+                    if self.isNotchVisible {
+                        self.hideNotch(screen: scr, animated: false)
+                    }
+                } else {
+                    // Settled on desktop!
+                    self.isSpaceTransitioning = false
+                    if !self.isNotchVisible {
+                        self.showNotch(screen: scr)
+                    }
+                    self.cancelSpaceTransitionWorkItems()
+                    return
+                }
+
+                if isLast {
+                    self.isSpaceTransitioning = false
+                }
             }
+            spaceTransitionWorkItems.append(item)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
         }
-        spaceChangeWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: workItem)
     }
 
     @objc private func triggerCheck() {
@@ -821,7 +847,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard bounds.width >= 200 else { continue }
 
             // Native macOS fullscreen window starts at top (y <= 1) and spans full screen height
-            if bounds.origin.y <= 1 && bounds.height >= (screenFrame.height - 2) {
+            if bounds.origin.y <= 1 && bounds.height >= (screenFrame.height - 25) {
                 return true
             }
         }
@@ -906,6 +932,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() {
         disableOutsideClickMonitor()
+        cancelSpaceTransitionWorkItems()
         if let monitor = flagsMonitor {
             NSEvent.removeMonitor(monitor)
             flagsMonitor = nil
